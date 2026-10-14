@@ -57,7 +57,7 @@ st.markdown("""
 # Header Banner
 st.markdown("""
     <div class="main-header">
-        <p class="main-title">🛡️ RouteSafe: SafeSync Multi-Hazard Emergency & Logistics Portal</p>
+        <p class="main-title">🛡️ RouteSafe: Emergency & Logistics Portal</p>
         <p class="sub-title">Official Real-Time Disaster Response, Road Disruption Management & Automated Alternate Rerouting System</p>
     </div>
 """, unsafe_allow_html=True)
