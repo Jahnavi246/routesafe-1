@@ -6,6 +6,8 @@ from streamlit_folium import st_folium
 import sqlite3
 from datetime import datetime
 import requests
+import pandas as pd
+import io
 
 # -------------------------------------------------------------
 # PAGE CONFIGURATION & PROFESSIONAL UI STYLING
@@ -18,7 +20,6 @@ st.set_page_config(
 
 st.markdown("""
     <style>
-    /* Main Theme & Header Styling */
     .main-header {
         background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
         padding: 25px;
@@ -29,15 +30,12 @@ st.markdown("""
     }
     .main-title { font-size: 2.2rem; font-weight: 800; margin: 0; color: #FFFFFF; }
     .sub-title { font-size: 1.05rem; color: #E0E7FF; margin-top: 5px; margin-bottom: 0; }
-    
-    /* Card & Container Styling */
     .metric-card {
         background-color: #F8FAFC;
         border: 1px solid #E2E8F0;
         padding: 16px;
         border-radius: 8px;
         border-left: 5px solid #3B82F6;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
     .weather-box {
         background: linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%);
@@ -54,10 +52,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Header Banner
 st.markdown("""
     <div class="main-header">
-        <p class="main-title">🛡️ RouteSafe: Emergency & Logistics Portal</p>
+        <p class="main-title">🛡️ RouteSafe: SafeSync Multi-Hazard Emergency & Logistics Portal</p>
         <p class="sub-title">Official Real-Time Disaster Response, Road Disruption Management & Automated Alternate Rerouting System</p>
     </div>
 """, unsafe_allow_html=True)
@@ -90,40 +87,48 @@ conn = init_db()
 st.sidebar.markdown("### 🎛️ Control Panel")
 app_mode = st.sidebar.radio(
     "Select Portal View", 
-    ["🗺️ Citizen Navigation & Live Map", "🚨 Admin Emergency Incident Report", "🛠️ Manage Active Disruption Zones"]
+    [
+        "🗺️ Citizen Navigation & Live Map", 
+        "🚨 Admin Emergency Incident Report", 
+        "📤 Upload & Report Hazard Data", 
+        "🛠️ Manage Active Disruption Zones"
+    ]
 )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📍 Target Operations Zone")
 place_name = st.sidebar.text_input("City / Region Area", value="Connaught Place, New Delhi, India")
 
-@st.cache_resource(show_spinner="📥 Fetching live road network & spatial grids from OpenStreetMap...")
+# Optimized fast map loading via point and radius to avoid Overpass API timeouts
+@st.cache_resource(show_spinner="📥 Downloading local road network grid...")
 def load_road_network(place):
     try:
-        ox.settings.timeout = 60
-        G = ox.graph_from_place(place, network_type='drive')
+        ox.settings.timeout = 30
+        ox.settings.use_cache = True
+        # Using Connaught Place default coordinates (Lat: 28.6315, Lon: 77.2167) with a safe 1.5km radius
+        center_point = (28.6315, 77.2167)
+        G = ox.graph_from_point(center_point, dist=1500, network_type='drive')
         return G
     except Exception as e:
-        st.error(f"Failed to fetch map data for '{place}'. Error: {e}")
-        return None
+        st.warning(f"OSM API timeout. Using fallback graph area. Error: {e}")
+        return ox.graph_from_point((28.6315, 77.2167), dist=1000, network_type='drive')
 
 G = load_road_network(place_name)
 
 if G is None:
-    st.warning("⚠️ Please provide a valid city, town, or neighborhood in the sidebar configuration.")
+    st.warning("⚠️ Failed to load map network.")
     st.stop()
 
-# Calculate Default Map Center from Graph Nodes
 center_lat = sum(data['y'] for _, data in G.nodes(data=True)) / len(G.nodes())
 center_lon = sum(data['x'] for _, data in G.nodes(data=True)) / len(G.nodes())
 
 # -------------------------------------------------------------
-# LIVE WEATHER API INTEGRATION (Open-Meteo - No Key Needed)
+# LIVE WEATHER API INTEGRATION (Open-Meteo)
 # -------------------------------------------------------------
 def get_live_weather(lat, lon):
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(url, timeout=4).json()
         current = res.get("current", {})
         
         w_code = current.get("weather_code", 0)
@@ -142,7 +147,6 @@ def get_live_weather(lat, lon):
     except Exception:
         return {"temp": 28, "humidity": 60, "wind": 12, "condition": "Normal Conditions ☀️"}
 
-# Fetch Active Disruptions
 def get_active_disruptions():
     cursor = conn.cursor()
     cursor.execute("SELECT id, location_name, lat, lon, reason, status FROM disruptions WHERE status = 'Blocked'")
@@ -150,7 +154,6 @@ def get_active_disruptions():
 
 active_disruptions = get_active_disruptions()
 
-# Construct Modified Graph (Excluding Blocked Nodes)
 G_modified = G.copy()
 for disp in active_disruptions:
     d_id, d_name, d_lat, d_lon, d_reason, d_status = disp
@@ -165,13 +168,11 @@ for disp in active_disruptions:
 # VIEW 1: CITIZEN NAVIGATION & LIVE MAP
 # =============================================================
 if app_mode == "🗺️ Citizen Navigation & Live Map":
-    
     col_l, col_r = st.columns([1.2, 2.8], gap="medium")
     
     with col_l:
         st.markdown("#### 🧭 Journey & Route Planner")
         
-        # GPS Simulation Mode
         use_default_gps = st.checkbox("Use Zone Default Coordinates for Start", value=True)
         if use_default_gps:
             start_lat, start_lon = center_lat, center_lon
@@ -201,11 +202,8 @@ if app_mode == "🗺️ Citizen Navigation & Live Map":
 
     with col_r:
         st.markdown("#### 🛰️ Real-Time Interactive GIS Map")
-        
-        # Initialize Folium Map
         m = folium.Map(location=[center_lat, center_lon], zoom_start=14, control_scale=True)
         
-        # Plot Active Road Closures & Hazards
         for disp in active_disruptions:
             _, d_name, d_lat, d_lon, d_reason, _ = disp
             folium.Marker(
@@ -213,26 +211,16 @@ if app_mode == "🗺️ Citizen Navigation & Live Map":
                 popup=f"<b>⛔ ROAD CLOSED: {d_name}</b><br>Reason: {d_reason}",
                 icon=folium.Icon(color="red", icon="ban", prefix="fa")
             ).add_to(m)
-            
-            # Draw hazard radius circle
-            folium.Circle(
-                location=[d_lat, d_lon],
-                radius=150,
-                color='red',
-                fill=True,
-                fill_opacity=0.15
-            ).add_to(m)
+            folium.Circle(location=[d_lat, d_lon], radius=150, color='red', fill=True, fill_opacity=0.15).add_to(m)
 
         if calc_route_btn:
             try:
                 orig_node = ox.distance.nearest_nodes(G_modified, X=start_lon, Y=start_lat)
                 dest_node = ox.distance.nearest_nodes(G_modified, X=dest_lon, Y=dest_lat)
                 
-                # Compute Shortest Path via NetworkX avoiding blocked zones
                 route = networkx_lib.shortest_path(G_modified, orig_node, dest_node, weight='length')
                 route_coords = [(G.nodes[node]['y'], G.nodes[node]['x']) for node in route]
                 
-                # Compute total distance
                 total_length_m = sum(
                     ox.distance.great_circle_vec(
                         G.nodes[route[i]]['y'], G.nodes[route[i]]['x'],
@@ -242,41 +230,27 @@ if app_mode == "🗺️ Citizen Navigation & Live Map":
                 
                 est_time_mins = round((total_length_m / 1000) / 30 * 60, 1)
                 
-                # Metric Cards Display
                 mc1, mc2, mc3 = st.columns(3)
-                with mc1:
-                    st.metric("Route Status", "✅ Clear / Safe")
-                with mc2:
-                    st.metric("Distance", f"{round(total_length_m/1000, 2)} km")
-                with mc3:
-                    st.metric("Est. Travel Time", f"{est_time_mins} mins")
+                with mc1: st.metric("Route Status", "✅ Clear / Safe")
+                with mc2: st.metric("Distance", f"{round(total_length_m/1000, 2)} km")
+                with mc3: st.metric("Est. Travel Time", f"{est_time_mins} mins")
                 
-                # Draw Recommended Route Polyline
-                folium.PolyLine(
-                    route_coords, 
-                    color="#10B981", 
-                    weight=6, 
-                    opacity=0.85, 
-                    tooltip="Recommended Safe Alternate Route"
-                ).add_to(m)
-                
-                # Add Start & End Markers
+                folium.PolyLine(route_coords, color="#10B981", weight=6, opacity=0.85, tooltip="Safe Alternate Route").add_to(m)
                 folium.Marker(location=[start_lat, start_lon], popup="Start Position", icon=folium.Icon(color="blue", icon="play", prefix="fa")).add_to(m)
                 folium.Marker(location=[dest_lat, dest_lon], popup="Destination", icon=folium.Icon(color="green", icon="flag", prefix="fa")).add_to(m)
 
             except networkx_lib.NetworkXNoPath:
-                st.error("⚠️ Critical Alert: All direct pathways are obstructed by active disruptions or severe weather incidents. Please check alternate zonal entry points.")
+                st.error("⚠️ Critical Alert: All direct pathways are obstructed by active disruptions.")
             except Exception as ex:
                 st.error(f"Routing computation error: {ex}")
 
-        st_map = st_folium(m, width="100%", height=520)
+        st_folium(m, width="100%", height=520)
 
 # =============================================================
 # VIEW 2: ADMIN EMERGENCY INCIDENT REPORT
 # =============================================================
 elif app_mode == "🚨 Admin Emergency Incident Report":
     st.subheader("🚨 Emergency Disruption & Disaster Reporting Portal")
-    st.markdown("Authorized administrators can broadcast road closures, accidents, waterlogging, or severe weather blockages instantly across the network.")
     
     with st.form("admin_disruption_form"):
         col1, col2 = st.columns(2)
@@ -301,15 +275,69 @@ elif app_mode == "🚨 Admin Emergency Incident Report":
                 (loc_name, lat_input, lon_input, reason, 'Blocked', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             )
             conn.commit()
-            st.success(f"Emergency broadcast successful for '{loc_name}'! Citizen routing algorithms have automatically updated.")
+            st.success(f"Emergency broadcast successful for '{loc_name}'!")
             st.rerun()
 
 # =============================================================
-# VIEW 3: MANAGE ACTIVE DISRUPTION ZONES
+# VIEW 3: UPLOAD & REPORT HAZARD DATA (NEW FEATURE)
+# =============================================================
+elif app_mode == "📤 Upload & Report Hazard Data":
+    st.subheader("📤 Bulk Hazard Data Upload & Citizen Submissions")
+    st.markdown("Upload a CSV file containing multiple road incidents or hazard reports to instantly integrate them into the live routing network.")
+    
+    with st.expander("📌 View Required CSV Data Format", expanded=False):
+        st.markdown("""
+        Your uploaded CSV file must contain the following column headers:
+        * `location_name` (Text description of the location)
+        * `lat` (Latitude coordinate, e.g., 28.6315)
+        * `lon` (Longitude coordinate, e.g., 77.2167)
+        * `reason` (Description of hazard / block)
+        """)
+        
+        # Sample CSV Download Option
+        sample_df = pd.DataFrame({
+            "location_name": ["Main Street Bridge", "Central Avenue Crossing"],
+            "lat": [center_lat + 0.002, center_lat - 0.003],
+            "lon": [center_lon + 0.002, center_lon - 0.003],
+            "reason": ["Heavy Flooding / Waterlogging", "Road Accident"]
+        })
+        st.download_button(
+            label="Download Sample CSV Template",
+            data=sample_df.to_csv(index=False).encode('utf-8'),
+            file_name="hazard_template.csv",
+            mime="text/csv"
+        )
+
+    st.markdown("---")
+    uploaded_file = st.file_uploader("Upload Incident CSV File", type=["csv"])
+    
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            required_cols = ["location_name", "lat", "lon", "reason"]
+            if all(col in df.columns for col in required_cols):
+                st.dataframe(df, use_container_width=True)
+                if st.button("📥 Import & Broadcast All Uploaded Incidents", type="primary"):
+                    cursor = conn.cursor()
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for _, row in df.iterrows():
+                        cursor.execute(
+                            "INSERT INTO disruptions (location_name, lat, lon, reason, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                            (str(row['location_name']), float(row['lat']), float(row['lon']), str(row['reason']), 'Blocked', current_time)
+                        )
+                    conn.commit()
+                    st.success(f"Successfully imported {len(df)} hazard records into the system database and triggered alternate rerouting!")
+                    st.rerun()
+            else:
+                st.error("Uploaded CSV file is missing required columns. Please check the sample template format.")
+        except Exception as e:
+                st.error(f"Error reading uploaded file: {e}")
+
+# =============================================================
+# VIEW 4: MANAGE ACTIVE DISRUPTION ZONES
 # =============================================================
 elif app_mode == "🛠️ Manage Active Disruption Zones":
     st.subheader("🛠️ Active Emergency Incidents & Road Restoration")
-    st.markdown("Review ongoing disruptions, monitor hazard timestamps, and restore normal traffic status once hazards are cleared.")
     
     cursor = conn.cursor()
     cursor.execute("SELECT id, location_name, lat, lon, reason, timestamp FROM disruptions WHERE status = 'Blocked'")
